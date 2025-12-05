@@ -12,27 +12,20 @@ LIMIT = 120         # how many recent candles
 
 
 def fetch_coinbase():
-    """
-    Fetch 1-minute OHLC candles from Coinbase Exchange for BTC-USD.
-    """
     url = f"https://api.exchange.coinbase.com/products/{SYMBOL}/candles"
-    params = {
-        "granularity": GRANULARITY
-        # Coinbase returns up to 300 candles; no explicit 'limit' param,
-        # but granularity gives 1m candles going back in time.
-    }
-
+    params = {"granularity": GRANULARITY}
     headers = {
         "Accept": "application/json",
         "User-Agent": "coinbase-ohlc-loader/1.0"
     }
 
     r = requests.get(url, params=params, headers=headers, timeout=10)
+    print("Coinbase status:", r.status_code)
+    print("Coinbase url:", r.url)
     r.raise_for_status()
     raw = r.json()
 
-    # raw is: [ [time, low, high, open, close, volume], ... ]
-    # time is Unix timestamp (seconds)
+    # raw: [ [ time, low, high, open, close, volume ], ... ]
     rows = []
     for c in raw[:LIMIT]:
         ts = datetime.datetime.utcfromtimestamp(c[0]).replace(
@@ -50,8 +43,6 @@ def fetch_coinbase():
             "volume": volume,
         })
 
-    # Coinbase returns newest first; BigQuery doesn’t care, but you might
-    # want chronological order:
     rows.sort(key=lambda r: r["ts"])
     return rows
 
@@ -60,27 +51,38 @@ def replace_bigquery_table(rows):
     client = bigquery.Client(project=PROJECT_ID)
     table_id = f"{PROJECT_ID}.{DATASET}.{TABLE}"
 
-    # Delete all existing rows
-    delete_query = f"DELETE FROM `{table_id}` WHERE TRUE"
-    client.query(delete_query).result()
+    # 🔁 Use LOAD job with WRITE_TRUNCATE instead of DELETE + streaming insert
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+    )
 
-    # Insert new rows
-    errors = client.insert_rows_json(table_id, rows)
-    if errors:
-        print("Insert errors:", errors)
-    else:
-        print(f"Inserted {len(rows)} rows into {table_id}")
+    print(f"Loading {len(rows)} rows into {table_id} with WRITE_TRUNCATE...")
+    load_job = client.load_table_from_json(
+        rows,
+        table_id,
+        job_config=job_config,
+    )
+    load_job.result()  # wait for job to finish
+
+    print("Load job state:", load_job.state)
+    print("Output rows:", load_job.output_rows)
 
 
 def main(request=None):
-    print("Fetching Coinbase candles…")
-    rows = fetch_coinbase()
+    try:
+        print("Fetching Coinbase candles…")
+        rows = fetch_coinbase()
+        print("Fetched", len(rows), "rows")
 
-    print(f"Fetched {len(rows)} rows")
-    print("Replacing BigQuery table…")
-    replace_bigquery_table(rows)
+        print("Replacing BigQuery table via LOAD job…")
+        replace_bigquery_table(rows)
 
-    return "Done"
+        print("Done successfully.")
+        return "Done", 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return str(e), 500
 
 
 if __name__ == "__main__":
