@@ -1,85 +1,87 @@
 import datetime
-import os
-
 import requests
 from google.cloud import bigquery
 
-# Change if needed
-PROJECT_ID = os.environ.get("GCP_PROJECT", "bitcoin-480204")
-DATASET_ID = "crypto"
-TABLE_ID = "btc_ohlc_1m"
-SYMBOL = "BTCUSDT"
-INTERVAL = "1m"       # 1-minute candles
-LIMIT = 120           # how many recent candles to fetch
+PROJECT_ID = "bitcoin-480204"
+DATASET = "crypto"
+TABLE = "btc_ohlc_1m"
+
+SYMBOL = "BTC-USD"  # Coinbase product id
+GRANULARITY = 60    # 60 seconds = 1 minute
+LIMIT = 120         # how many recent candles
 
 
-def fetch_binance_klines(symbol: str = SYMBOL,
-                         interval: str = INTERVAL,
-                         limit: int = LIMIT):
+def fetch_coinbase():
     """
-    Fetch 1m OHLC candles from Binance.
-    Returns a list of dicts ready for BigQuery insert.
+    Fetch 1-minute OHLC candles from Coinbase Exchange for BTC-USD.
     """
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    url = f"https://api.exchange.coinbase.com/products/{SYMBOL}/candles"
+    params = {
+        "granularity": GRANULARITY
+        # Coinbase returns up to 300 candles; no explicit 'limit' param,
+        # but granularity gives 1m candles going back in time.
+    }
 
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    raw = resp.json()
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "coinbase-ohlc-loader/1.0"
+    }
 
+    r = requests.get(url, params=params, headers=headers, timeout=10)
+    r.raise_for_status()
+    raw = r.json()
+
+    # raw is: [ [time, low, high, open, close, volume], ... ]
+    # time is Unix timestamp (seconds)
     rows = []
-    for k in raw:
-        open_time_ms = k[0]         # open time in milliseconds
-        open_time = datetime.datetime.utcfromtimestamp(
-            open_time_ms / 1000.0
-        ).replace(tzinfo=datetime.timezone.utc)
-
-        rows.append(
-            {
-                "ts": open_time.isoformat(),  # BigQuery accepts RFC3339 string
-                "symbol": symbol,
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            }
+    for c in raw[:LIMIT]:
+        ts = datetime.datetime.utcfromtimestamp(c[0]).replace(
+            tzinfo=datetime.timezone.utc
         )
+        low, high, open_, close, volume = map(float, c[1:6])
 
+        rows.append({
+            "ts": ts.isoformat(),
+            "symbol": SYMBOL,
+            "open": open_,
+            "high": high,
+            "low":  low,
+            "close": close,
+            "volume": volume,
+        })
+
+    # Coinbase returns newest first; BigQuery doesn’t care, but you might
+    # want chronological order:
+    rows.sort(key=lambda r: r["ts"])
     return rows
 
 
-def insert_rows_bigquery(rows):
-    """
-    Insert rows into BigQuery table bitcoin-480204.crypto.btc_ohlc_1m.
-    """
+def replace_bigquery_table(rows):
     client = bigquery.Client(project=PROJECT_ID)
-    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+    table_id = f"{PROJECT_ID}.{DATASET}.{TABLE}"
 
-    if not rows:
-        print("No rows to insert.")
-        return "No rows", 200
+    # Delete all existing rows
+    delete_query = f"DELETE FROM `{table_id}` WHERE TRUE"
+    client.query(delete_query).result()
 
-    errors = client.insert_rows_json(table_ref, rows)
+    # Insert new rows
+    errors = client.insert_rows_json(table_id, rows)
     if errors:
-        # Log and return error
-        print("BigQuery insert errors:", errors)
-        return f"BigQuery insert errors: {errors}", 500
-
-    print(f"Inserted {len(rows)} rows into {table_ref}")
-    return f"Inserted {len(rows)} rows into {table_ref}", 200
+        print("Insert errors:", errors)
+    else:
+        print(f"Inserted {len(rows)} rows into {table_id}")
 
 
-# 🌐 Cloud Function HTTP entry point
-def ingest_binance_to_bq(request):
-    """
-    HTTP Cloud Function entrypoint.
-    Fetches recent Binance candles and inserts into BigQuery.
-    """
-    try:
-        rows = fetch_binance_klines()
-        msg, status = insert_rows_bigquery(rows)
-        return msg, status
-    except Exception as e:
-        print("Error in ingest_binance_to_bq:", e)
-        return str(e), 500
+def main(request=None):
+    print("Fetching Coinbase candles…")
+    rows = fetch_coinbase()
+
+    print(f"Fetched {len(rows)} rows")
+    print("Replacing BigQuery table…")
+    replace_bigquery_table(rows)
+
+    return "Done"
+
+
+if __name__ == "__main__":
+    main()
