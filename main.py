@@ -1,4 +1,5 @@
 import datetime
+import time
 import requests
 from google.cloud import bigquery
 
@@ -51,7 +52,7 @@ def replace_bigquery_table(rows):
     client = bigquery.Client(project=PROJECT_ID)
     table_id = f"{PROJECT_ID}.{DATASET}.{TABLE}"
 
-    # 🔁 Use LOAD job with WRITE_TRUNCATE instead of DELETE + streaming insert
+    # Use LOAD job with WRITE_TRUNCATE instead of DELETE + streaming insert
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
     )
@@ -68,22 +69,38 @@ def replace_bigquery_table(rows):
     print("Output rows:", load_job.output_rows)
 
 
-def main(request=None):
-    try:
-        print("Fetching Coinbase candles…")
-        rows = fetch_coinbase()
-        print("Fetched", len(rows), "rows")
+def run_once():
+    """Run a single fetch + BigQuery replace cycle."""
+    print("Fetching Coinbase candles…")
+    rows = fetch_coinbase()
+    print("Fetched", len(rows), "rows")
 
-        print("Replacing BigQuery table via LOAD job…")
-        replace_bigquery_table(rows)
+    print("Replacing BigQuery table via LOAD job…")
+    replace_bigquery_table(rows)
 
-        print("Done successfully.")
-        return "Done", 200
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return str(e), 500
+    print("Cycle completed successfully.")
+
+
+def main():
+    """Continuous loop: run every ~60 seconds."""
+    while True:
+        start = datetime.datetime.utcnow()
+        print(f"\n=== New cycle at {start.isoformat()}Z ===")
+
+        try:
+            run_once()
+        except Exception as e:
+            import traceback
+            print("Error during cycle:", e)
+            traceback.print_exc()
+
+        # Sleep ~60 seconds before next run
+        print("Sleeping 60 seconds before next cycle…")
+        time.sleep(60)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Shutting down loop gracefully…")
